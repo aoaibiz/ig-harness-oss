@@ -1,0 +1,9 @@
+# Rewrite dynamic detail routes to the pre-rendered shell. CF Pages serves
+# /<route>/_/ as index.html natively; the client component reads useParams()
+# from the URL at runtime.
+/campaigns/:id/edit/ /campaigns/_/edit/ 200
+/campaigns/:id/edit /campaigns/_/edit/ 200
+/campaigns/:id/ /campaigns/_/ 200
+/campaigns/:id /campaigns/_/ 200
+/rich-messages/:id/ /rich-messages/_/ 200
+/rich-messages/:id /rich-messages/_/ 200

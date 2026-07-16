@@ -1,0 +1,42 @@
+{
+  "name": "@ig-harness/ig-sdk",
+  "version": "0.1.0",
+  "description": "Typed Instagram Graph API wrapper with rich message builders",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "instagram",
+    "graph-api",
+    "sdk",
+    "messaging",
+    "crm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Shudesu/ig-harness-oss.git",
+    "directory": "packages/ig-sdk"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}
