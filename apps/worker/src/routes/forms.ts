@@ -13,6 +13,7 @@ import { getFriendByLineUserId, getFriendById, getIgAccountById } from '@ig-harn
 import { addTagToFriend, enrollFriendInScenario } from '@ig-harness/db';
 import type { Form as DbForm, FormSubmission as DbFormSubmission } from '@ig-harness/db';
 import { resolveAccount, getAccountClient } from '../lib/accounts.js';
+import { autoSendEnabled, autoDmCaps, reserveAutoSend, withinStandardWindow } from '../services/auto-send-safety.js';
 import type { Env } from '../index.js';
 
 const forms = new Hono<Env>();
@@ -278,11 +279,20 @@ forms.post('/api/forms/:id/submit', async (c) => {
       // Send confirmation message via IG DM
       sideEffects.push(
         (async () => {
+          // RUNTIME DARK-GATE: the form ack is an AUTOMATED DM triggered by a
+          // web submission, not by an IG inbound message — it must obey the
+          // same capability switch as every other auto-sender.
+          if (!autoSendEnabled(c.env)) return;
           console.log('Form reply: starting for friendId', friendId);
           const friend = await getFriendById(db, friendId!);
           if (!friend) { console.log('Form reply: friend not found'); return; }
           const igsid = friend.igsid;
           if (!igsid) { console.log('Form reply: no igsid'); return; }
+          // POLICY: recipient:{id} is legal only inside the person's 24h
+          // standard window (their last inbound IG message). A form submit is
+          // NOT an IG message, so check the real window; outside → no DM.
+          const inWindow = await withinStandardWindow(db, friend.id);
+          if (!inWindow) { console.log('Form reply: outside 24h window — skipped (policy)'); return; }
           console.log('Form reply: sending to', igsid);
           // Public submits carry no ?account_id= — the form's owning account
           // (not the deploy default) must send the confirmation DM.
@@ -290,6 +300,15 @@ forms.post('/api/forms/:id/submit', async (c) => {
             ? await getIgAccountById(c.env.DB, form.account_id)
             : await resolveAccount(c);
           if (!account) { console.log('Form reply: no IG account configured'); return; }
+          // Outbound cap (reserve-before-send; both ack messages ride one
+          // reservation — they answer a single user action).
+          const reserved = await reserveAutoSend(db, {
+            accountId: account.id,
+            igsid,
+            kind: 'form_ack',
+            caps: autoDmCaps(c.env),
+          });
+          if (!reserved.ok) return;
           const igClient = await getAccountClient(c.env, c.env.DB, account);
 
           // Build summary text from answers

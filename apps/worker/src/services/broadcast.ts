@@ -9,8 +9,36 @@ import type { Broadcast } from '@ig-harness/db';
 import type { InstagramClient } from '@ig-harness/ig-sdk';
 import { calculateStaggerDelay, sleep } from './rate-limit.js';
 import { recordDmFailure } from '../lib/health.js';
+import {
+  reserveAutoSend,
+  withinStandardWindow,
+  DEFAULT_AUTO_DM_CAPS,
+  type AutoDmCaps,
+} from './auto-send-safety.js';
 
 const BATCH_SIZE = 50; // IG API is more conservative than LINE
+
+/**
+ * Per-recipient compliance + cap guard for one broadcast send. Returns true
+ * when the send may fire. POLICY: a broadcast is a recipient:{id} push, legal
+ * only within the recipient's 24h standard window (last inbound message) —
+ * out-of-window recipients are SKIPPED, not failed (their sends would be
+ * rejected by Meta and each rejection is a spam signal against the account).
+ * When the account cap denies, the caller stops the whole remaining run.
+ */
+async function guardBroadcastRecipient(
+  db: D1Database,
+  followerId: number | string,
+  igsid: string,
+  accountId: string,
+  caps: AutoDmCaps,
+): Promise<'send' | 'skip_window' | 'stop_cap'> {
+  const inWindow = await withinStandardWindow(db, followerId);
+  if (!inWindow) return 'skip_window';
+  const reserved = await reserveAutoSend(db, { accountId, igsid, kind: 'broadcast', caps });
+  if (!reserved.ok) return 'stop_cap';
+  return 'send';
+}
 
 export async function processBroadcastSend(
   db: D1Database,
@@ -18,6 +46,7 @@ export async function processBroadcastSend(
   broadcastId: number | string,
   _workerUrl?: string,
   accountId?: string,
+  caps: AutoDmCaps = DEFAULT_AUTO_DM_CAPS,
 ): Promise<Broadcast> {
   await updateBroadcastStatus(db, broadcastId, 'sending');
 
@@ -26,8 +55,11 @@ export async function processBroadcastSend(
     throw new Error(`Broadcast ${broadcastId} not found`);
   }
 
+  const capAccountId = accountId ?? broadcast.account_id ?? 'default';
   const messageBody = JSON.parse(broadcast.body) as Record<string, unknown>;
   let totalSent = 0;
+  let skippedWindow = 0;
+  let stoppedByCap = false;
 
   try {
     if (!broadcast.tag_filter) {
@@ -40,7 +72,7 @@ export async function processBroadcastSend(
       const followers = await stmt.all<{ id: number; igsid: string }>();
       const allFollowers = followers.results;
 
-      for (let i = 0; i < allFollowers.length; i += BATCH_SIZE) {
+      outer: for (let i = 0; i < allFollowers.length; i += BATCH_SIZE) {
         const batch = allFollowers.slice(i, i + BATCH_SIZE);
         const batchIndex = Math.floor(i / BATCH_SIZE);
 
@@ -51,6 +83,9 @@ export async function processBroadcastSend(
 
         for (const follower of batch) {
           try {
+            const verdict = await guardBroadcastRecipient(db, follower.id, follower.igsid, capAccountId, caps);
+            if (verdict === 'skip_window') { skippedWindow++; continue; }
+            if (verdict === 'stop_cap') { stoppedByCap = true; break outer; }
             await sendIgMessage(igClient, follower.igsid, broadcast.message_type, messageBody);
             totalSent++;
 
@@ -78,7 +113,7 @@ export async function processBroadcastSend(
         accountId: broadcast.account_id ?? undefined,
       });
 
-      for (let i = 0; i < friends.length; i += BATCH_SIZE) {
+      outerTag: for (let i = 0; i < friends.length; i += BATCH_SIZE) {
         const batch = friends.slice(i, i + BATCH_SIZE);
         const batchIndex = Math.floor(i / BATCH_SIZE);
 
@@ -89,6 +124,9 @@ export async function processBroadcastSend(
 
         for (const friend of batch) {
           try {
+            const verdict = await guardBroadcastRecipient(db, friend.id, friend.igsid, capAccountId, caps);
+            if (verdict === 'skip_window') { skippedWindow++; continue; }
+            if (verdict === 'stop_cap') { stoppedByCap = true; break outerTag; }
             await sendIgMessage(igClient, friend.igsid, broadcast.message_type, messageBody);
             totalSent++;
 
@@ -107,6 +145,11 @@ export async function processBroadcastSend(
       }
     }
 
+    if (skippedWindow > 0 || stoppedByCap) {
+      console.warn(
+        `[broadcast] ${broadcastId}: sent=${totalSent} skipped_out_of_window=${skippedWindow} stopped_by_cap=${stoppedByCap ? 1 : 0}`,
+      );
+    }
     await updateBroadcastStatus(db, broadcastId, 'sent', { totalSent });
   } catch (err) {
     await updateBroadcastStatus(db, broadcastId, 'draft');
@@ -121,6 +164,7 @@ export async function processScheduledBroadcasts(
   igClient: InstagramClient,
   workerUrl?: string,
   accountId?: string,
+  caps: AutoDmCaps = DEFAULT_AUTO_DM_CAPS,
 ): Promise<void> {
   // When an accountId is given, the due extraction is scoped at the SQL level
   // so each account's cron tick only picks up its own scheduled broadcasts.
@@ -136,7 +180,7 @@ export async function processScheduledBroadcasts(
 
   for (const broadcast of scheduled) {
     try {
-      await processBroadcastSend(db, igClient, broadcast.id, workerUrl, accountId);
+      await processBroadcastSend(db, igClient, broadcast.id, workerUrl, accountId, caps);
     } catch (err) {
       console.error(`Failed to send scheduled broadcast ${broadcast.id}:`, err);
     }

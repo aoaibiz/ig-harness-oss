@@ -56,6 +56,11 @@ function makeDb(deliveries: any[], gates: any[]) {
           if (sql.includes('gate_target_posts')) {
             return null as T;
           }
+          // withinStandardWindow: report a fresh inbound message so the drip
+          // sends are inside the 24h standard messaging window in these tests.
+          if (sql.includes('FROM messages_log')) {
+            return { created_at: new Date().toISOString() } as T;
+          }
           return null as T;
         },
         run: async () => ({ meta: { changes: 1 } }),

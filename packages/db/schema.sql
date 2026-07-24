@@ -330,3 +330,65 @@ CREATE INDEX IF NOT EXISTS idx_scenarios_account ON scenarios(account_id);
 CREATE INDEX IF NOT EXISTS idx_broadcasts_account ON broadcasts(account_id);
 CREATE INDEX IF NOT EXISTS idx_gates_account ON engagement_gates(account_id);
 CREATE INDEX IF NOT EXISTS idx_tracked_links_account ON tracked_links(account_id);
+
+-- ── Auto-send safety (2026-07-22, ships OFF by default) ──
+-- Mirrors migrations/0021_auto_send_safety.sql and 0022_autodm_dark_disarm.sql
+-- so a FRESH deploy (which builds its D1 from this consolidated schema) has
+-- the tables. Three independent layers, all DURABLE in D1 (a worker restart
+-- or re-deploy can never reset them — resetting = abuse/cap bypass):
+--
+-- 1. comment_deliveries — trigger-level idempotency claims (claim-before-send):
+--    one row is CLAIMED (INSERT before send) per (trigger, event). Webhook
+--    REDELIVERY of the same comment/message hits the PRIMARY KEY and is
+--    dropped. The partial UNIQUE index additionally guarantees a comment_rule
+--    DMs the same person at most ONCE ever (per rule), race-proof at the SQL
+--    layer (two concurrent webhooks with different comments by the same
+--    author cannot both insert).
+CREATE TABLE IF NOT EXISTS comment_deliveries (
+  trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('comment_rule','gate','gate_dm','scenario','scenario_dm')),
+  trigger_id   TEXT NOT NULL,
+  event_id     TEXT NOT NULL,  -- IG comment id (comment triggers) / message mid (DM triggers)
+  igsid        TEXT NOT NULL,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now'))),
+  PRIMARY KEY (trigger_kind, trigger_id, event_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_comment_deliveries_rule_recipient
+  ON comment_deliveries(trigger_id, igsid)
+  WHERE trigger_kind = 'comment_rule';
+CREATE INDEX IF NOT EXISTS idx_comment_deliveries_igsid ON comment_deliveries(igsid);
+
+-- 2. auto_send_ledger — rolling outbound accounting for ALL automated DM sends
+--    (comment rules, gates incl. followup drip, scenarios, broadcasts, form
+--    acks). A row is RESERVED before the Graph send fires (reserve-before-send;
+--    a crash after reserve costs quota, never costs a recipient spam;
+--    ambiguous send outcomes are NEVER refunded). Caps are enforced by
+--    COUNTing this table over rolling 1h/24h windows.
+CREATE TABLE IF NOT EXISTS auto_send_ledger (
+  id         TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  igsid      TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  sent_at    INTEGER NOT NULL  -- epoch milliseconds
+);
+CREATE INDEX IF NOT EXISTS idx_auto_send_ledger_account_time
+  ON auto_send_ledger(account_id, sent_at);
+CREATE INDEX IF NOT EXISTS idx_auto_send_ledger_recipient_time
+  ON auto_send_ledger(account_id, igsid, sent_at);
+
+-- 3. autodm_disarm_log — dark-state reconcile sweep audit (mirrors
+--    migrations/0022_autodm_dark_disarm.sql; restore SQL documented there).
+--    AUTO_DM_ENABLED only gates FIRING; rows armed BEFORE the capability went
+--    dark stay armed in D1. The cron sweep (reconcileDarkAutoSend) disarms
+--    comment_rules / engagement_gates / scenarios while dark and audits each
+--    flip here so go-live can restore exactly the sweep-disarmed set — and
+--    never anything the owner paused deliberately.
+CREATE TABLE IF NOT EXISTS autodm_disarm_log (
+  id          TEXT PRIMARY KEY,
+  entity_kind TEXT NOT NULL CHECK(entity_kind IN ('comment_rule','engagement_gate','scenario')),
+  entity_id   TEXT NOT NULL,
+  disarmed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now'))),
+  restored_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_autodm_disarm_open
+  ON autodm_disarm_log(entity_kind, entity_id)
+  WHERE restored_at IS NULL;

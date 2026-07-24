@@ -27,6 +27,7 @@ import { accounts } from './routes/accounts.js';
 import { capabilities } from './routes/capabilities.js';
 import { ensureDefaultAccount, getAccountClient, toIgAccountRef } from './lib/accounts.js';
 import { recordCronRun, recordTokenValidity } from './lib/health.js';
+import { autoSendEnabled, autoDmCaps, reconcileDarkAutoSend } from './services/auto-send-safety.js';
 
 export type Env = {
   Bindings: {
@@ -41,6 +42,18 @@ export type Env = {
     IG_VERIFY_TOKEN: string;
     API_KEY: string;
     WORKER_URL: string;
+    // Worker-layer AUTO-DM kill-switch (comment rules / engagement gates /
+    // scenarios / broadcasts / drip / form acks). '1' = automated sending
+    // enabled; unset/empty/anything else = OFF (fail-closed default).
+    // While OFF, pre-armed ACTIVE rules in this worker's D1 can NOT fire —
+    // the webhook/cron/API entry points refuse all automated sends.
+    AUTO_DM_ENABLED?: string;
+    // Outbound auto-send caps (positive integers; unset/invalid → conservative
+    // defaults 100/h, 300/24h per account, 5/24h per recipient — see
+    // services/auto-send-safety.ts for the Meta-limit basis).
+    AUTO_DM_HOURLY_CAP?: string;
+    AUTO_DM_DAILY_CAP?: string;
+    AUTO_DM_RECIPIENT_DAILY_CAP?: string;
     IG_USERNAME?: string;
     CONTACT_EMAIL?: string;
     LINE_ADD_URL?: string;
@@ -282,6 +295,21 @@ async function scheduled(
   await ensureDefaultAccount(env, env.DB);
   // waitUntil keeps the write alive even if scheduled() resolves early.
   ctx.waitUntil(recordCronRun(env.DB).catch(() => {}));
+  // DARK-STATE RECONCILE SWEEP: AUTO_DM_ENABLED only gates FIRING — rules /
+  // gates / scenarios armed BEFORE the capability went dark stay armed in D1.
+  // While dark, every cron tick disarms them (audited + restorable, see
+  // migration 0022) so a regression that ever lost the runtime gates below
+  // would find nothing armed to fire. Idempotent: after the first pass each
+  // sweep statement touches 0 rows. Fail-soft inside — a sweep error must
+  // never take down the token-liveness loop below.
+  const autoDmLit = autoSendEnabled(env);
+  if (!autoDmLit) {
+    ctx.waitUntil(
+      reconcileDarkAutoSend(env.DB).catch((err) =>
+        console.error('[cron] dark reconcile sweep failed:', err),
+      ),
+    );
+  }
   // `accounts` is the route module above — use a distinct name here.
   const igAccounts = await listIgAccounts(env.DB, { activeOnly: true });
 
@@ -309,12 +337,20 @@ async function scheduled(
         })
         .catch(() => recordTokenValidity(env.DB, account.id, false).catch(() => {})),
     );
+    // RUNTIME DARK-GATE: all three cron processors are automated senders
+    // (scenario steps, scheduled broadcasts, gate followup drip). While
+    // AUTO_DM_ENABLED !== '1' none of them may run — armed schedules sit
+    // still. Token liveness + cron heartbeat above stay active regardless.
+    if (!autoDmLit) {
+      continue;
+    }
+    const caps = autoDmCaps(env);
     const ref = toIgAccountRef(account);
     const taskNames = ['processStepDeliveries', 'processScheduledBroadcasts', 'processFollowupDrip'] as const;
     const results = await Promise.allSettled([
-      processStepDeliveries(env.DB, igClient, env.WORKER_URL, account.id),
-      processScheduledBroadcasts(env.DB, igClient, env.WORKER_URL, account.id),
-      processFollowupDrip(env.DB, igClient, env.WORKER_URL, undefined, ref, account.id),
+      processStepDeliveries(env.DB, igClient, env.WORKER_URL, account.id, caps),
+      processScheduledBroadcasts(env.DB, igClient, env.WORKER_URL, account.id, caps),
+      processFollowupDrip(env.DB, igClient, env.WORKER_URL, undefined, ref, account.id, caps),
     ]);
     results.forEach((result, i) => {
       if (result.status === 'rejected') {

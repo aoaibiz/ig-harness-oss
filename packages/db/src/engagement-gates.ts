@@ -365,6 +365,9 @@ export async function updateGateDelivery(
     last_check_at?: string | null;
     followup_step_sent?: number;
     next_followup_at?: string | null;
+    /** JSON string — used by the private-reply CTA flow to park/clear the
+     *  pr_ack_pending flag on a delivery. */
+    metadata?: string;
   },
 ): Promise<void> {
   const fields = Object.keys(patch).filter((k) => (patch as Record<string, unknown>)[k] !== undefined);

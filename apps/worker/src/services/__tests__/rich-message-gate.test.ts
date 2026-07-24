@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { triggerGateForComment, handleFollowCheckPostback } from '../engagement-gate.js';
+import { triggerGateForDmKeyword, handleFollowCheckPostback } from '../engagement-gate.js';
 
 // In-memory D1 mock with rich_messages support
 function createMockDb() {
@@ -70,6 +70,7 @@ const ig = {
   sendQuickReply: vi.fn(async () => ({})),
   sendText: vi.fn(async () => ({})),
   sendImage: vi.fn(async () => ({})),
+  sendPrivateReply: vi.fn(async () => ({})),
   sendRichMessage: vi.fn(async () => ({ sentBlocks: 1 })),
   getUserProfile: vi.fn(async () => ({ is_user_follow_business: true })),
 };
@@ -77,7 +78,10 @@ const ig = {
 describe('engagement gate with rich messages', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 
-  it('sends rich CTA when initial_dm_rich_message_id is set', async () => {
+  // NOTE (policy, 2026-07-22): comment-triggered CTAs now leave as TEXT
+  // Private Replies, so the rich CTA path is exercised via the dm_keyword
+  // trigger (an in-window response to the user's own message).
+  it('sends rich CTA when initial_dm_rich_message_id is set (dm_keyword)', async () => {
     const db = createMockDb();
     db.richMessages.push({
       id: 'rm-cta',
@@ -88,9 +92,9 @@ describe('engagement gate with rich messages', () => {
     db.gates.push({
       id: 'gate-1',
       status: 'active',
-      trigger_type: 'comment_on_post',
-      target_post_id: 'post-1',
-      trigger_keyword: null,
+      trigger_type: 'dm_keyword',
+      target_post_id: null,
+      trigger_keyword: '特典',
       require_follow: 1,
       initial_dm_text: '',
       initial_dm_button_label: 'x',
@@ -104,9 +108,8 @@ describe('engagement gate with rich messages', () => {
       follow_reminder_dm_rich_message_id: null,
     });
 
-    await triggerGateForComment(db, ig as never, {
-      postId: 'post-1',
-      commentText: 'any text',
+    await triggerGateForDmKeyword(db, ig as never, {
+      text: '特典ください',
       follower: { id: 42, igsid: 'IGSID42' },
     });
 
@@ -122,9 +125,9 @@ describe('engagement gate with rich messages', () => {
     db.gates.push({
       id: 'gate-2',
       status: 'active',
-      trigger_type: 'comment_on_post',
-      target_post_id: 'post-1',
-      trigger_keyword: null,
+      trigger_type: 'dm_keyword',
+      target_post_id: null,
+      trigger_keyword: '特典',
       require_follow: 1,
       initial_dm_text: 'legacy cta',
       initial_dm_button_label: '押す',
@@ -138,9 +141,8 @@ describe('engagement gate with rich messages', () => {
       follow_reminder_dm_rich_message_id: null,
     });
 
-    await triggerGateForComment(db, ig as never, {
-      postId: 'post-1',
-      commentText: 'any',
+    await triggerGateForDmKeyword(db, ig as never, {
+      text: '特典ほしい',
       follower: { id: 1, igsid: 'IG1' },
     });
 

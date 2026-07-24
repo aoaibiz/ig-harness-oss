@@ -17,7 +17,19 @@ import {
   logMessage,
 } from '@ig-harness/db';
 import { buildIgMessage, expandVariables } from '../services/step-delivery.js';
-import { handleFollowCheckPostback, triggerGateForComment, triggerGateForDmKeyword, triggerGateForStoryMention } from '../services/engagement-gate.js';
+import { handleFollowCheckPostback, handlePendingPrAck, triggerGateForComment, triggerGateForDmKeyword } from '../services/engagement-gate.js';
+import {
+  autoSendEnabled,
+  autoDmCaps,
+  claimTriggerDelivery,
+  reserveAutoSend,
+  DEFAULT_AUTO_DM_CAPS,
+  type AutoDmCaps,
+} from '../services/auto-send-safety.js';
+
+/** Fail-closed default for internal handlers: auto-send OFF unless the route
+ *  explicitly threads the runtime switch through. */
+const AUTO_DM_OFF = { enabled: false, caps: DEFAULT_AUTO_DM_CAPS };
 import type { IgAccountRef } from '../services/line-cross-link.js';
 import { listIgAccounts } from '@ig-harness/db';
 import { ensureDefaultAccount, pickAccountForEntry, toIgAccountRef, getAccountClient } from '../lib/accounts.js';
@@ -107,6 +119,12 @@ webhook.post('/webhook', async (c) => {
     return c.json({ status: 'ok' }, 200);
   }
 
+  // RUNTIME DARK-GATE (auto-DM capability switch): computed ONCE per webhook
+  // and threaded into every handler. When off, pre-armed ACTIVE rules/gates/
+  // scenarios in this worker's D1 can NOT fire — dark means dark at the
+  // worker layer, independent of any upstream proxy forcing rules inactive.
+  const autoDm = { enabled: autoSendEnabled(c.env), caps: autoDmCaps(c.env) };
+
   // Process asynchronously — Meta expects quick response
   const processingPromise = (async () => {
     for (const entry of body.entry) {
@@ -127,7 +145,7 @@ webhook.post('/webhook', async (c) => {
       const messagingEvents = entry.messaging ?? entry.standby ?? [];
       for (const event of messagingEvents) {
         try {
-          await handleMessagingEvent(db, igClient, event, c.env.WORKER_URL, igAccount, account.id);
+          await handleMessagingEvent(db, igClient, event, c.env.WORKER_URL, igAccount, account.id, autoDm);
         } catch (err) {
           console.error('Error handling messaging event:', err);
         }
@@ -138,7 +156,7 @@ webhook.post('/webhook', async (c) => {
         for (const change of entry.changes) {
           try {
             if (change.field === 'comments') {
-              await handleCommentEvent(db, igClient, change.value, account.ig_user_id, c.env.WORKER_URL, igAccount, account.id);
+              await handleCommentEvent(db, igClient, change.value, account.ig_user_id, c.env.WORKER_URL, igAccount, account.id, autoDm);
             } else if (change.field === 'mentions') {
               await handleMentionEvent(db, igClient, change.value, igAccount, account.id);
             }
@@ -161,6 +179,7 @@ async function handleMessagingEvent(
   workerUrl?: string,
   igAccount?: IgAccountRef,
   accountId?: string,
+  autoDm: { enabled: boolean; caps: AutoDmCaps } = AUTO_DM_OFF,
 ): Promise<void> {
   const senderId = event.sender.id;
 
@@ -235,6 +254,32 @@ async function handleMessagingEvent(
       return; // Don't process further
     }
 
+    // ── RUNTIME DARK-GATE: everything below this point is AUTOMATED
+    // marketing-class sending (gates, scenarios). When the capability is off,
+    // pre-armed ACTIVE rows in D1 must NOT fire. (The CONNECT ack above stays:
+    // it is a transactional direct answer to the user's own explicit command,
+    // sent inside their open 24h window.)
+    if (!autoDm.enabled) {
+      return;
+    }
+
+    // Private-reply CTA continuation: if this person has a parked comment-
+    // gate CTA (pr_ack_pending), their reply = the "button press" — resume
+    // the follow-check flow in-window. Consumes the message; keyword
+    // triggers are skipped for this event.
+    try {
+      const acked = await handlePendingPrAck(db, igClient, {
+        igsid: senderId,
+        workerBaseUrl: workerUrl,
+        igAccount,
+        accountId,
+        caps: autoDm.caps,
+      });
+      if (acked) return;
+    } catch (err) {
+      console.error('pr-ack continuation failed:', err);
+    }
+
     // Engagement gate DM keyword trigger
     try {
       const triggered = await triggerGateForDmKeyword(db, igClient, {
@@ -242,6 +287,8 @@ async function handleMessagingEvent(
         follower: { id: follower.id, igsid: senderId },
         igAccount,
         accountId,
+        messageId: event.message.mid,
+        caps: autoDm.caps,
       });
       if (triggered) {
         // Skip scenario triggers if gate fired
@@ -261,6 +308,17 @@ async function handleMessagingEvent(
           scenario.trigger_keyword
         ) {
           if (incomingText.includes(scenario.trigger_keyword)) {
+            // Webhook-redelivery dedup: the same message mid re-delivered
+            // must not double-enroll / double-send (claim-before-act).
+            if (event.message.mid) {
+              const claimed = await claimTriggerDelivery(db, {
+                kind: 'scenario_dm',
+                triggerId: String(scenario.id),
+                eventId: event.message.mid,
+                igsid: senderId,
+              });
+              if (!claimed) break;
+            }
             const existing = await db
               .prepare(`SELECT id FROM follower_scenarios WHERE follower_id = ? AND scenario_id = ?`)
               .bind(follower.id, scenario.id)
@@ -268,10 +326,20 @@ async function handleMessagingEvent(
             if (!existing) {
               const friendScenario = await enrollFriendInScenario(db, follower.id, scenario.id);
 
-              // Immediate delivery of first step if delay=0
+              // Immediate delivery of first step if delay=0. The send is
+              // in-window (answers the user's own message) — but it still
+              // pays the outbound cap; denied → skip here and let the
+              // (window+cap guarded) cron step-delivery retry later.
               const steps = await getScenarioSteps(db, scenario.id);
               const firstStep = steps[0];
               if (firstStep && firstStep.delay_minutes === 0 && friendScenario.status === 'active') {
+                const reserved = await reserveAutoSend(db, {
+                  accountId: accountId ?? 'default',
+                  igsid: senderId,
+                  kind: 'scenario_step',
+                  caps: autoDm.caps,
+                });
+                if (!reserved.ok) break;
                 try {
                   const expandedContent = expandVariables(firstStep.body, follower);
                   const parsed = JSON.parse(expandedContent);
@@ -306,10 +374,36 @@ async function handleMessagingEvent(
 
   }
 
-  // Handle postback events
+  // Handle postback events — gate-driven auto-sends (reward/reminder), so
+  // the runtime dark-gate applies here too: an armed gate's button in an old
+  // DM must not produce sends while the capability is off.
   if (event.postback) {
+    if (!autoDm.enabled) {
+      return;
+    }
     const payload = parsePostbackPayload(event.postback.payload ?? '');
     if (payload.kind === 'check_follow') {
+      // Webhook-redelivery dedup (claim-before-send): Meta postbacks are
+      // at-least-once, so the SAME button press (same postback mid) can be
+      // delivered again — without this claim it would re-run the follow-check
+      // and re-send the reward/reminder (a rich reward fans out to N Graph
+      // calls, so a redelivery duplicates up to N in-window messages and burns
+      // the recipient cap). A DISTINCT press has a distinct mid, so legitimate
+      // repeat presses (reminder → follow → reward) still proceed. Keyed under
+      // kind='gate' with a 'pb:' event-id prefix so the postback-mid keyspace
+      // is domain-separated from the comment-trigger 'gate' claims (whose
+      // event_id is an IG comment id); a value collision could only ever fail
+      // closed (suppress a send), never over-send, and the prefix removes even
+      // that theoretical case. Fail-closed: a store error refuses the send.
+      if (event.postback.mid) {
+        const claimed = await claimTriggerDelivery(db, {
+          kind: 'gate',
+          triggerId: payload.gateId,
+          eventId: `pb:${event.postback.mid}`,
+          igsid: senderId,
+        });
+        if (!claimed) return;
+      }
       try {
         await handleFollowCheckPostback(db, igClient, {
           gateId: payload.gateId,
@@ -317,6 +411,8 @@ async function handleMessagingEvent(
           igsid: senderId,
           workerBaseUrl: workerUrl,
           igAccount,
+          accountId,
+          caps: autoDm.caps,
         });
         // Log button press as inbound gate message
         const postbackTitle = event.postback.title ?? event.postback.payload ?? '';
@@ -344,6 +440,7 @@ async function handleCommentEvent(
   _workerUrl?: string,
   igAccount?: IgAccountRef,
   accountId?: string,
+  autoDm: { enabled: boolean; caps: AutoDmCaps } = AUTO_DM_OFF,
 ): Promise<void> {
   const senderId = value.from.id;
   const commentText = value.text;
@@ -376,6 +473,14 @@ async function handleCommentEvent(
     accountId,
   });
 
+  // ── RUNTIME DARK-GATE: every comment-triggered path below is an automated
+  // send (gate CTA, rule DM, scenario enrollment). When the capability is
+  // off, a pre-armed ACTIVE rule in this worker's D1 must NOT fire — the
+  // follower upsert above still runs (CRM data, no outbound).
+  if (!autoDm.enabled) {
+    return;
+  }
+
   // Engagement gate trigger — runs FIRST so a configured gate takes precedence
   // over the legacy comment-rule flow. If a gate fires, we skip the rule loop
   // and the gate-triggered scenarios below to avoid double DMs.
@@ -389,6 +494,7 @@ async function handleCommentEvent(
       commenterUsername: value.from?.username,
       igAccount,
       accountId,
+      caps: autoDm.caps,
     });
   } catch (err) {
     console.error('Engagement gate trigger failed:', err);
@@ -453,6 +559,32 @@ async function handleCommentEvent(
     }
 
     if (isMatch) {
+      // Dedup BEFORE anything fires (claim-before-send):
+      //   • same comment REDELIVERED by Meta → PK conflict → no second DM;
+      //   • same person triggering this rule via a DIFFERENT comment →
+      //     partial-unique (rule, igsid) conflict → one DM per person per
+      //     rule, ever (race-proof at the SQL layer).
+      const claimed = await claimTriggerDelivery(db, {
+        kind: 'comment_rule',
+        triggerId: String(rule.id),
+        eventId: value.id,
+        igsid: senderId,
+      });
+      if (!claimed) {
+        break; // already handled (or store refused: fail-closed) — never re-send
+      }
+
+      // Outbound cap (reserve-before-send; never refunded).
+      const reserved = await reserveAutoSend(db, {
+        accountId: accountId ?? 'default',
+        igsid: senderId,
+        kind: 'comment_rule',
+        caps: autoDm.caps,
+      });
+      if (!reserved.ok) {
+        break;
+      }
+
       // Apply delay if configured
       if (rule.delay_seconds > 0) {
         await new Promise((resolve) => setTimeout(resolve, rule.delay_seconds * 1000));
@@ -468,34 +600,58 @@ async function handleCommentEvent(
         console.error('Comment reply failed:', err);
       }
 
-      // Send DM to commenter (expand variables in response body)
+      // DM to the commenter — as a PRIVATE REPLY (recipient:{comment_id}),
+      // the only policy-sanctioned DM from a comment trigger (verified
+      // 2026-07-22 against Meta docs: one per comment, ≤7 days, TEXT is the
+      // documented payload). recipient:{id} here was the policy violation
+      // that puts the connected account at risk of Meta enforcement.
+      // Non-text response bodies have no documented private-reply shape →
+      // the DM is SKIPPED (fail-closed), never downgraded to recipient:{id}.
       const expandedBody = rule.response_body
         .replace(/\{\{igsid\}\}/g, senderId)
         .replace(/\{\{username\}\}/g, value.from.username)
         .replace(/\{\{follower_id\}\}/g, String(follower.id));
-      const responseBody = JSON.parse(expandedBody);
-      await sendIgResponse(igClient, senderId, rule.response_type, responseBody);
-
-      // Log outgoing message
-      await db
-        .prepare(
-          `INSERT INTO messages_log (follower_id, direction, message_type, body, trigger_source)
-           VALUES (?, 'out', ?, ?, 'comment_rule')`,
-        )
-        .bind(follower.id, rule.response_type, rule.response_body)
-        .run();
+      const responseBody = JSON.parse(expandedBody) as Record<string, unknown>;
+      const dmText = typeof responseBody.text === 'string' ? responseBody.text : null;
+      if (dmText) {
+        await igClient.sendPrivateReply(value.id, dmText);
+        // Log outgoing message
+        await db
+          .prepare(
+            `INSERT INTO messages_log (follower_id, direction, message_type, body, trigger_source)
+             VALUES (?, 'out', 'text', ?, 'comment_rule')`,
+          )
+          .bind(follower.id, JSON.stringify({ text: dmText }))
+          .run();
+      } else {
+        console.warn(
+          `[comment-rule] rule=${rule.id} response_type=${rule.response_type} has no text — ` +
+          'no policy-compliant Private Reply shape, DM skipped',
+        );
+      }
 
       break; // Only send first matching rule
     }
   }
 
-  // Check comment-triggered scenarios — skip if a gate fired
+  // Check comment-triggered scenarios — skip if a gate fired.
+  // Enrollment only (no send here). The steps themselves are delivered by the
+  // cron path, which enforces the 24h standard window + caps — a comment-
+  // enrolled follower who never DMs is never pushed a DM (policy).
   if (gateFired) return;
   const scenarios = await getScenarios(db, { accountId });
   for (const scenario of scenarios) {
     if (scenario.trigger_type === 'comment' && scenario.is_active) {
       const keywordMatch = !scenario.trigger_keyword || commentText.toLowerCase().includes(scenario.trigger_keyword.toLowerCase());
       if (keywordMatch) {
+        // Webhook-redelivery dedup (same comment id → single enrollment path).
+        const claimed = await claimTriggerDelivery(db, {
+          kind: 'scenario',
+          triggerId: String(scenario.id),
+          eventId: value.id,
+          igsid: senderId,
+        });
+        if (!claimed) continue;
         const existing = await db
           .prepare(`SELECT id FROM follower_scenarios WHERE follower_id = ? AND scenario_id = ?`)
           .bind(follower.id, scenario.id)
@@ -543,58 +699,37 @@ async function sendIgResponse(
 }
 
 // ── Story/Post Mention Handler ──
+// ⚠️ AUTO-DM GATED OFF (policy, 2026-07-22): a `mentions` change event is a
+// mention in a comment/caption on SOMEONE ELSE'S media. That gives us
+// neither an open 24h messaging window (it is not an inbound message) nor
+// Private-Reply eligibility (the comment is not on OUR media) — there is NO
+// documented compliant way to DM the mentioner from this webhook. The old
+// behavior here (recipient:{id} thank-you DM / story_mention gate CTA) was
+// exactly the unsolicited-DM class that triggers Meta enforcement against
+// the connected account. We now only
+// record the mentioner as a follower (CRM), and send NOTHING. A compliant
+// story_mention flow must instead hang off the MESSAGING webhook
+// (story_mention attachment = inbound message = open window).
 async function handleMentionEvent(
   db: D1Database,
-  igClient: InstagramClient,
+  _igClient: InstagramClient,
   value: { media_id?: string; comment_id?: string; mentioned_user_id?: string },
-  igAccount?: IgAccountRef,
+  _igAccount?: IgAccountRef,
   accountId?: string,
 ): Promise<void> {
-  // When someone mentions us in their story, send them a DM
   const mentionerId = (value as any).from?.id ?? (value as any).mentioned_user_id;
   if (!mentionerId) return;
 
   const mentionerUsername = (value as any).from?.username ?? 'friend';
 
-  // Upsert follower
-  const follower = await upsertFriend(db, {
+  // Upsert follower (CRM only — no outbound send from this event, see above)
+  await upsertFriend(db, {
     igsid: mentionerId,
     username: mentionerUsername,
     displayName: null,
     pictureUrl: null,
     accountId,
   });
-
-  // Engagement gate trigger (story_mention) — fires before the legacy thank-you DM
-  // so a configured campaign takes precedence over the hard-coded reply.
-  try {
-    const triggered = await triggerGateForStoryMention(db, igClient, {
-      follower: { id: follower.id, igsid: mentionerId },
-      igAccount,
-      accountId,
-    });
-    if (triggered) return;
-  } catch (err) {
-    console.error('Story mention gate trigger failed:', err);
-  }
-
-  // Send thank you DM (fallback when no gate matches)
-  try {
-    await igClient.sendText(
-      mentionerId,
-      `@${mentionerUsername} ストーリーズでメンションありがとう！🙏✨ とても嬉しいです！`,
-    );
-
-    await db
-      .prepare(
-        `INSERT INTO messages_log (follower_id, direction, message_type, body, trigger_source)
-         VALUES (?, 'out', 'text', ?, 'manual')`,
-      )
-      .bind(follower.id, JSON.stringify({ text: `ストーリーズメンション自動返信 to @${mentionerUsername}` }))
-      .run();
-  } catch (err) {
-    console.error('Mention DM failed:', err);
-  }
 }
 
 export { webhook };

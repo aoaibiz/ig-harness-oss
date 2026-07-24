@@ -9,6 +9,7 @@ import {
 } from '@ig-harness/db';
 import type { Broadcast as DbBroadcast, BroadcastMessageType } from '@ig-harness/db';
 import { processBroadcastSend } from '../services/broadcast.js';
+import { autoSendEnabled, autoDmCaps } from '../services/auto-send-safety.js';
 import { resolveAccount, getAccountClient } from '../lib/accounts.js';
 import type { Env } from '../index.js';
 
@@ -154,6 +155,13 @@ broadcasts.delete('/api/broadcasts/:id', async (c) => {
 
 // POST /api/broadcasts/:id/send - send now
 broadcasts.post('/api/broadcasts/:id/send', async (c) => {
+  // WORKER-LAYER KILL-SWITCH (same layering as MEDIA_PUBLISH_ENABLED): a
+  // broadcast is a bulk automated DM — dark until AUTO_DM_ENABLED='1'.
+  // The worker is publicly reachable, so upstream proxies gating this is
+  // not enough; the refusal must live here too.
+  if (!autoSendEnabled(c.env)) {
+    return c.json({ success: false, error: 'auto_send_disabled' }, 403);
+  }
   try {
     const id = c.req.param('id');
     const existing = await getBroadcastById(c.env.DB, id);
@@ -174,7 +182,7 @@ broadcasts.post('/api/broadcasts/:id/send', async (c) => {
       : await resolveAccount(c);
     if (!account) return c.json({ success: false, error: 'account not found' }, 404);
     const igClient = await getAccountClient(c.env, c.env.DB, account);
-    await processBroadcastSend(c.env.DB, igClient, existing.id, c.env.WORKER_URL, account.id);
+    await processBroadcastSend(c.env.DB, igClient, existing.id, c.env.WORKER_URL, account.id, autoDmCaps(c.env));
 
     const result = await getBroadcastById(c.env.DB, existing.id);
     return c.json({ success: true, data: result ? serializeBroadcast(result) : null });

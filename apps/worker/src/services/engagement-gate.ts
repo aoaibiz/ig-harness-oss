@@ -3,6 +3,13 @@ import type { EngagementGate, GateDelivery } from '@ig-harness/db';
 import type { UserProfile, RichMessageBlock, RichMessageContext } from '@ig-harness/ig-sdk';
 import { resolveLineCrossLinkUrl, type IgAccountRef } from './line-cross-link.js';
 import { recordDmFailure } from '../lib/health.js';
+import {
+  claimTriggerDelivery,
+  reserveAutoSend,
+  withinStandardWindow,
+  DEFAULT_AUTO_DM_CAPS,
+  type AutoDmCaps,
+} from './auto-send-safety.js';
 
 /**
  * Compute the outbound reward URL for one recipient, optionally rewritten
@@ -51,6 +58,9 @@ interface IgClientLike {
   sendQuickReply(recipientId: string, text: string, items: unknown[]): Promise<unknown>;
   sendText(recipientId: string, text: string): Promise<unknown>;
   sendImage(recipientId: string, imageUrl: string): Promise<unknown>;
+  /** Private Reply — recipient:{comment_id}, the only policy-compliant DM
+   *  from a comment trigger (one per comment, ≤7 days, text). */
+  sendPrivateReply(commentId: string, text: string): Promise<unknown>;
   sendRichMessage(
     recipientId: string,
     blocks: RichMessageBlock[],
@@ -87,8 +97,11 @@ export async function triggerGateForComment(
     igAccount?: IgAccountRef;
     /** Owning account row id (ig_accounts.id) — scopes gate matching. */
     accountId?: string;
+    /** Outbound caps (from env). Defaults to the conservative built-ins. */
+    caps?: AutoDmCaps;
   },
 ): Promise<boolean> {
+  const caps = args.caps ?? DEFAULT_AUTO_DM_CAPS;
   const all = await listEngagementGates(db, { activeOnly: true, accountId: args.accountId });
 
   // Score + filter candidates so a post-specific campaign always beats a
@@ -124,6 +137,27 @@ export async function triggerGateForComment(
   );
 
   for (const { gate } of candidates) {
+    // POLICY (Meta, verified 2026-07-22): a DM caused by a comment may ONLY be
+    // sent as a Private Reply addressed to the comment id. No comment id → no
+    // compliant send path → do not fire this gate at all.
+    if (!args.commentId) {
+      console.warn('[gate] comment trigger without comment id — skipped (no compliant send path)');
+      return false;
+    }
+
+    // Webhook-redelivery dedup: claim (gate, comment id) BEFORE any send. The
+    // same comment delivered again (Meta webhooks are at-least-once) finds the
+    // claim row and stops here — also enforces Meta's one-private-reply-per-
+    // comment rule for this gate.
+    const claimed = await claimTriggerDelivery(db, {
+      kind: 'gate',
+      triggerId: gate.id,
+      eventId: args.commentId,
+      igsid: args.follower.igsid,
+    });
+    if (!claimed) {
+      return true; // this comment was already handled (or store refused: fail-closed)
+    }
 
     const delivery = await createGateDelivery(db, {
       gate_id: gate.id,
@@ -143,7 +177,23 @@ export async function triggerGateForComment(
       return true;
     }
 
-    await sendCtaDm(db, igClient, gate, delivery, args.igAccount);
+    // Outbound cap (reserve-before-send; never refunded).
+    const reserved = await reserveAutoSend(db, {
+      accountId: args.accountId ?? 'default',
+      igsid: args.follower.igsid,
+      kind: 'gate_cta',
+      caps,
+    });
+    if (!reserved.ok) {
+      return true; // gate matched but the budget refuses the send
+    }
+
+    // The CTA leaves as a TEXT Private Reply (recipient:{comment_id}) — the
+    // only sanctioned shape. Buttons/templates are NOT documented for private
+    // replies, so the postback CTA is deferred: the reply asks the person to
+    // answer, and their answer (an inbound DM = open 24h window) resumes the
+    // flow via handlePendingPrAck → follow-check → reward/reminder templates.
+    await sendCtaPrivateReply(db, igClient, gate, delivery, args.commentId);
     await updateGateDelivery(db, delivery.id, { status: 'cta_sent' });
 
     // Optional public comment. Posted after the DM so a failure doesn't
@@ -183,12 +233,34 @@ export async function triggerGateForComment(
 export async function triggerGateForDmKeyword(
   db: D1Database,
   igClient: IgClientLike,
-  args: { text: string; follower: FollowerRef; igAccount?: IgAccountRef; accountId?: string },
+  args: {
+    text: string;
+    follower: FollowerRef;
+    igAccount?: IgAccountRef;
+    accountId?: string;
+    /** Inbound message mid — webhook-redelivery dedup key. */
+    messageId?: string;
+    caps?: AutoDmCaps;
+  },
 ): Promise<boolean> {
+  const caps = args.caps ?? DEFAULT_AUTO_DM_CAPS;
   const gates = await listEngagementGates(db, { activeOnly: true, accountId: args.accountId });
   for (const gate of gates) {
     if (gate.trigger_type !== 'dm_keyword') continue;
     if (!gate.trigger_keyword || !args.text.includes(gate.trigger_keyword)) continue;
+
+    // Webhook-redelivery dedup: the same inbound message (same mid) delivered
+    // again must not re-trigger. POLICY NOTE: the send itself is compliant
+    // as-is — it answers an inbound DM inside the standard 24h window.
+    if (args.messageId) {
+      const claimed = await claimTriggerDelivery(db, {
+        kind: 'gate_dm',
+        triggerId: gate.id,
+        eventId: args.messageId,
+        igsid: args.follower.igsid,
+      });
+      if (!claimed) return true;
+    }
 
     const delivery = await createGateDelivery(db, {
       gate_id: gate.id,
@@ -204,6 +276,16 @@ export async function triggerGateForDmKeyword(
       return true;
     }
 
+    const reserved = await reserveAutoSend(db, {
+      accountId: args.accountId ?? 'default',
+      igsid: args.follower.igsid,
+      kind: 'gate_cta',
+      caps,
+    });
+    if (!reserved.ok) {
+      return true;
+    }
+
     await sendCtaDm(db, igClient, gate, delivery, args.igAccount);
     await updateGateDelivery(db, delivery.id, { status: 'cta_sent' });
     return true;
@@ -211,6 +293,15 @@ export async function triggerGateForDmKeyword(
   return false;
 }
 
+/**
+ * ⚠️ POLICY-GATED OFF (2026-07-22): this trigger fired from the `mentions`
+ * change webhook — a mention in a comment/caption on SOMEONE ELSE'S media.
+ * That is neither an inbound message (no 24h window) nor a comment on OUR
+ * media (no Private Reply eligibility), so there is NO documented compliant
+ * way to DM the mentioner. webhook.ts no longer calls this; it stays only so
+ * a future messaging-event-based story_mention path (which IS in-window) can
+ * reuse it. Do not re-wire it to the mentions webhook.
+ */
 export async function triggerGateForStoryMention(
   db: D1Database,
   igClient: IgClientLike,
@@ -269,6 +360,96 @@ function parseCommentReplyPatterns(raw: string): string[] {
 
 // richMessageLabel removed — body now stores full JSON for rich rendering in admin UI
 
+/**
+ * Comment-triggered CTA as a Private Reply (recipient:{comment_id}) — the
+ * only sanctioned DM from a comment. TEXT only (the documented shape), so
+ * instead of a postback button the reply asks the person to answer; their
+ * answer is an inbound DM that opens the standard 24h window, at which point
+ * handlePendingPrAck resumes the normal follow-check flow (reward/reminder
+ * templates are then legal in-window sends). The pr_ack_pending flag parks
+ * that continuation on the delivery row.
+ */
+async function sendCtaPrivateReply(
+  db: D1Database,
+  igClient: IgClientLike,
+  gate: EngagementGate,
+  delivery: GateDelivery,
+  commentId: string,
+): Promise<void> {
+  const text = `${gate.initial_dm_text}\n\n📩 このメッセージに「${gate.initial_dm_button_label}」と返信してください`;
+  await igClient.sendPrivateReply(commentId, text);
+  let meta: Record<string, unknown> = {};
+  try { meta = JSON.parse(delivery.metadata || '{}') as Record<string, unknown>; } catch { meta = {}; }
+  meta.pr_ack_pending = true;
+  await updateGateDelivery(db, delivery.id, { metadata: JSON.stringify(meta) });
+  await logMessage(db, {
+    followerId: delivery.follower_id,
+    direction: 'out',
+    messageType: 'text',
+    body: text,
+    triggerSource: 'gate',
+  });
+}
+
+/**
+ * Resume a private-reply CTA when the person answers. Called from the
+ * webhook on EVERY inbound DM: if this igsid has a parked cta_sent delivery
+ * (pr_ack_pending), their reply = consent + open 24h window → run the normal
+ * follow-check flow (reward or reminder-with-button, both now in-window).
+ *
+ * The flag is cleared with a GUARDED UPDATE first (changes=1 wins) so a
+ * webhook redelivery of the same inbound message — or two racing messages —
+ * can never double-run the reward path.
+ */
+export async function handlePendingPrAck(
+  db: D1Database,
+  igClient: IgClientLike,
+  args: {
+    igsid: string;
+    workerBaseUrl?: string;
+    igAccount?: IgAccountRef;
+    accountId?: string;
+    caps?: AutoDmCaps;
+  },
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT * FROM gate_deliveries
+       WHERE igsid = ? AND status = 'cta_sent' AND metadata LIKE '%"pr_ack_pending":true%'
+       ORDER BY triggered_at DESC LIMIT 1`,
+    )
+    .bind(args.igsid)
+    .first<GateDelivery>();
+  if (!row) return false;
+
+  let meta: Record<string, unknown> = {};
+  try { meta = JSON.parse(row.metadata || '{}') as Record<string, unknown>; } catch { meta = {}; }
+  delete meta.pr_ack_pending;
+  const cleared = await db
+    .prepare(
+      `UPDATE gate_deliveries SET metadata = ?
+       WHERE id = ? AND metadata LIKE '%"pr_ack_pending":true%'`,
+    )
+    .bind(JSON.stringify(meta), row.id)
+    .run();
+  if ((cleared.meta?.changes ?? 0) !== 1) return false; // another event won the race
+
+  try {
+    await handleFollowCheckPostback(db, igClient, {
+      gateId: row.gate_id,
+      deliveryId: row.id,
+      igsid: args.igsid,
+      workerBaseUrl: args.workerBaseUrl,
+      igAccount: args.igAccount,
+      accountId: args.accountId,
+      caps: args.caps,
+    });
+  } catch (err) {
+    console.error('[gate] pr-ack follow-check failed:', err);
+  }
+  return true;
+}
+
 async function sendCtaDm(
   db: D1Database,
   igClient: IgClientLike,
@@ -320,8 +501,17 @@ async function sendCtaDm(
 export async function handleFollowCheckPostback(
   db: D1Database,
   igClient: IgClientLike,
-  args: { gateId: string; deliveryId: string; igsid: string; workerBaseUrl?: string; igAccount?: IgAccountRef },
+  args: {
+    gateId: string;
+    deliveryId: string;
+    igsid: string;
+    workerBaseUrl?: string;
+    igAccount?: IgAccountRef;
+    accountId?: string;
+    caps?: AutoDmCaps;
+  },
 ): Promise<void> {
+  const caps = args.caps ?? DEFAULT_AUTO_DM_CAPS;
   const [gate, delivery] = await Promise.all([
     getEngagementGate(db, args.gateId),
     getGateDelivery(db, args.deliveryId),
@@ -330,6 +520,16 @@ export async function handleFollowCheckPostback(
   if (delivery.status === 'delivered' || delivery.status === 'dropped') return;
   // Honour the operator pause/archive switch even for already-issued CTAs.
   if (gate.status !== 'active') return;
+
+  // Outbound cap (reward OR reminder both cost one send). Denied → change
+  // nothing; the person's next press/message retries once budget frees up.
+  const reserved = await reserveAutoSend(db, {
+    accountId: args.accountId ?? 'default',
+    igsid: args.igsid,
+    kind: 'gate_followcheck',
+    caps,
+  });
+  if (!reserved.ok) return;
 
   const now = new Date().toISOString();
 
@@ -554,6 +754,7 @@ export async function processFollowupDrip(
   maxPerTick = 50,
   igAccount?: IgAccountRef,
   accountId?: string,
+  caps: AutoDmCaps = DEFAULT_AUTO_DM_CAPS,
 ): Promise<{ sent: number; skipped: number }> {
   const now = new Date().toISOString().slice(0, 19) + 'Z';
   // When accountId is given, scope the due extraction to deliveries whose
@@ -609,6 +810,30 @@ export async function processFollowupDrip(
         skipped++;
         continue;
       }
+    }
+
+    // Standard-window guard (policy): recipient:{id} sends are legal only
+    // within 24h of the person's LAST inbound message — the delivered_at
+    // anchor above approximates it, this checks the real thing. Outside →
+    // clear the schedule (a later step can never be in-window either).
+    const inWindow = await withinStandardWindow(db, d.follower_id);
+    if (!inWindow) {
+      await updateGateDelivery(db, d.id, { next_followup_at: null });
+      skipped++;
+      continue;
+    }
+
+    // Outbound cap — denied leaves next_followup_at untouched so the next
+    // tick retries once budget frees up (reserve-before-send, no refund).
+    const reserved = await reserveAutoSend(db, {
+      accountId: accountId ?? 'default',
+      igsid: d.igsid,
+      kind: 'gate_followup',
+      caps,
+    });
+    if (!reserved.ok) {
+      skipped++;
+      continue;
     }
 
     let sendOk = false;

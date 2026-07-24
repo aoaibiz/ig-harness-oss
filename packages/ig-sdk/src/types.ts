@@ -74,6 +74,16 @@ export interface SendTextPayload {
   message: { text: string };
 }
 
+/**
+ * Private Reply — the ONLY policy-sanctioned way to DM someone because they
+ * commented (Meta docs, verified 2026-07-22): recipient targets the COMMENT,
+ * not the user. One reply per comment, within 7 days, text documented.
+ */
+export interface SendPrivateReplyPayload {
+  recipient: { comment_id: string };
+  message: { text: string };
+}
+
 export interface SendImagePayload {
   recipient: { id: string };
   message: {

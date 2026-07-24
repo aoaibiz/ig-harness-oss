@@ -1,5 +1,6 @@
 import type {
   SendTextPayload,
+  SendPrivateReplyPayload,
   SendImagePayload,
   SendTemplatePayload,
   SendQuickReplyPayload,
@@ -50,6 +51,26 @@ export class InstagramClient {
   async sendText(recipientId: string, text: string): Promise<{ recipient_id: string; message_id: string }> {
     const payload: SendTextPayload = {
       recipient: { id: recipientId },
+      message: { text },
+    };
+    return this.request("POST", `/${this.igUserId}/messages`, payload);
+  }
+
+  /**
+   * Private Reply — DM the author of a comment on OUR media, addressed by
+   * COMMENT id (`recipient:{comment_id}`), never by user id. This is the only
+   * messaging-policy-compliant way to open a DM from a comment trigger
+   * (verified 2026-07-22 against Meta docs):
+   *   POST graph.instagram.com/{IG_ID}/messages
+   * Constraints enforced by Meta (callers must respect them): ONE private
+   * reply per comment, within 7 days of the comment (live: during broadcast
+   * only), TEXT payload is the documented shape. A follow-up with
+   * `recipient:{id}` is allowed only AFTER the person replies (standard 24h
+   * window). Platform ceiling: 750 private replies/hour per IG account.
+   */
+  async sendPrivateReply(commentId: string, text: string): Promise<{ recipient_id: string; message_id: string }> {
+    const payload: SendPrivateReplyPayload = {
+      recipient: { comment_id: commentId },
       message: { text },
     };
     return this.request("POST", `/${this.igUserId}/messages`, payload);

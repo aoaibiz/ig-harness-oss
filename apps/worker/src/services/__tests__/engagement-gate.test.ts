@@ -89,6 +89,7 @@ const fakeIgClient = {
   sendGenericTemplate: vi.fn(async () => ({})),
   sendQuickReply: vi.fn(async () => ({})),
   sendText: vi.fn(async () => ({})),
+  sendPrivateReply: vi.fn(async () => ({})),
   getUserProfile: vi.fn(async () => ({ is_user_follow_business: true })),
 };
 
@@ -97,7 +98,7 @@ describe('triggerGateForComment', () => {
     vi.clearAllMocks();
   });
 
-  it('creates a delivery and sends CTA DM when gate matches', async () => {
+  it('creates a delivery and sends the CTA as a Private Reply to the comment', async () => {
     const db = createMockDb();
     db.gates.push({
       id: 'gate-1',
@@ -119,15 +120,44 @@ describe('triggerGateForComment', () => {
       postId: 'post-1',
       commentText: '参加します',
       follower: { id: 42, igsid: 'IGSID42' },
+      commentId: 'comment-1',
     });
 
     expect(db.deliveries).toHaveLength(1);
     expect(db.deliveries[0].gate_id).toBe('gate-1');
     expect(db.deliveries[0].follower_id).toBe(42);
-    expect(fakeIgClient.sendGenericTemplate).toHaveBeenCalledTimes(1);
-    const call = fakeIgClient.sendGenericTemplate.mock.calls[0] as unknown as [string, unknown[]];
-    expect(call[0]).toBe('IGSID42');
-    expect(JSON.stringify(call[1])).toContain('CHECK_FOLLOW:gate-1:');
+    // POLICY: comment-triggered CTA must be a Private Reply addressed by
+    // COMMENT id — never a recipient:{id} template send.
+    expect(fakeIgClient.sendPrivateReply).toHaveBeenCalledTimes(1);
+    const call = fakeIgClient.sendPrivateReply.mock.calls[0] as unknown as [string, string];
+    expect(call[0]).toBe('comment-1');
+    expect(call[1]).toContain('特典の準備ができました');
+    expect(call[1]).toContain('特典を受け取る');
+    expect(fakeIgClient.sendGenericTemplate).not.toHaveBeenCalled();
+    expect(fakeIgClient.sendText).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fire when no comment id is available (no compliant send path)', async () => {
+    const db = createMockDb();
+    db.gates.push({
+      id: 'gate-1', status: 'active', trigger_type: 'comment_on_post',
+      target_post_id: 'post-1', trigger_keyword: null,
+      require_follow: 1, initial_dm_text: 'x', initial_dm_button_label: 'x',
+      follow_reminder_dm_text: '', follow_reminder_button_label: '',
+      reward_dm_text: '', reward_url: null, max_loops: 0,
+    });
+
+    const fired = await triggerGateForComment(db, fakeIgClient as never, {
+      postId: 'post-1',
+      commentText: 'any',
+      follower: { id: 42, igsid: 'IGSID42' },
+      // no commentId
+    });
+
+    expect(fired).toBe(false);
+    expect(db.deliveries).toHaveLength(0);
+    expect(fakeIgClient.sendPrivateReply).not.toHaveBeenCalled();
+    expect(fakeIgClient.sendGenericTemplate).not.toHaveBeenCalled();
   });
 
   it('does nothing when no active gate matches the post', async () => {
@@ -265,6 +295,7 @@ describe('logMessage integration', () => {
       sendGenericTemplate: vi.fn(async () => ({})),
       sendQuickReply: vi.fn(async () => ({})),
       sendText: vi.fn(async () => ({})),
+      sendPrivateReply: vi.fn(async () => ({})),
       getUserProfile: vi.fn(async () => ({ is_user_follow_business: true })),
     };
 
@@ -272,14 +303,17 @@ describe('logMessage integration', () => {
       postId: 'post-log',
       commentText: 'anything',
       follower: { id: 99, igsid: 'IGSID99' },
+      commentId: 'comment-log-1',
     });
 
+    // Comment CTA now leaves as a TEXT Private Reply (policy) — the log
+    // records messageType 'text'.
     expect(logMessage).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         direction: 'out',
         triggerSource: 'gate',
-        messageType: 'template',
+        messageType: 'text',
         followerId: 99,
       }),
     );
@@ -349,13 +383,16 @@ describe('logMessage integration', () => {
       },
     } as unknown as D1Database;
 
+    // NOTE: the rich CTA path now lives on the dm_keyword trigger — comment
+    // triggers send a TEXT Private Reply (policy), so the JSON rich body log
+    // convention is proven via the in-window DM-keyword CTA here.
     gates.push({
       id: 'gate-rich',
       status: 'active',
-      trigger_type: 'comment_on_post',
-      target_post_id: 'post-rich',
+      trigger_type: 'dm_keyword',
+      target_post_id: null,
       target_post_ids: [],
-      trigger_keyword: null,
+      trigger_keyword: 'リッチ',
       require_follow: 1,
       initial_dm_text: 'fallback text',
       initial_dm_button_label: 'Tap',
@@ -374,12 +411,13 @@ describe('logMessage integration', () => {
       sendGenericTemplate: vi.fn(async () => ({})),
       sendQuickReply: vi.fn(async () => ({})),
       sendText: vi.fn(async () => ({})),
+      sendPrivateReply: vi.fn(async () => ({})),
       getUserProfile: vi.fn(async () => ({ is_user_follow_business: true })),
     };
 
-    await triggerGateForComment(db, igClient as never, {
-      postId: 'post-rich',
-      commentText: 'anything',
+    const { triggerGateForDmKeyword } = await import('../engagement-gate.js');
+    await triggerGateForDmKeyword(db, igClient as never, {
+      text: 'リッチください',
       follower: { id: 77, igsid: 'IGSID77' },
     });
 

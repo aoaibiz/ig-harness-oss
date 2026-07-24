@@ -9,6 +9,12 @@ import {
 import type { InstagramClient } from '@ig-harness/ig-sdk';
 import { jitterDeliveryTime, addJitter, sleep } from './rate-limit.js';
 import { recordDmFailure } from '../lib/health.js';
+import {
+  reserveAutoSend,
+  withinStandardWindow,
+  DEFAULT_AUTO_DM_CAPS,
+  type AutoDmCaps,
+} from './auto-send-safety.js';
 
 /**
  * Replace template variables in message content.
@@ -57,6 +63,7 @@ export async function processStepDeliveries(
   igClient: InstagramClient,
   workerUrl?: string,
   accountId?: string,
+  caps: AutoDmCaps = DEFAULT_AUTO_DM_CAPS,
 ): Promise<void> {
   // Skip delivery outside 9:00-23:00 JST window
   const jstHour = new Date(Date.now() + 9 * 60 * 60_000).getUTCHours();
@@ -72,7 +79,7 @@ export async function processStepDeliveries(
       if (i > 0) {
         await sleep(addJitter(50, 200));
       }
-      await processSingleDelivery(db, igClient, fs, workerUrl);
+      await processSingleDelivery(db, igClient, fs, workerUrl, accountId, caps);
     } catch (err) {
       console.error(`Error processing friend_scenario ${fs.id}:`, err);
       await recordDmFailure(db, accountId ?? 'unknown').catch(() => {});
@@ -92,6 +99,8 @@ async function processSingleDelivery(
     next_step_at: string | null;
   },
   _workerUrl?: string,
+  accountId?: string,
+  caps: AutoDmCaps = DEFAULT_AUTO_DM_CAPS,
 ): Promise<void> {
   const friend = await getFriendById(db, fs.follower_id);
   if (!friend) {
@@ -142,6 +151,28 @@ async function processSingleDelivery(
       }
       return;
     }
+  }
+
+  // POLICY: a scheduled scenario step is a recipient:{id} send — legal ONLY
+  // within 24h of the follower's last inbound message. Outside the window:
+  // do NOT send and do NOT advance; the delivery stays pending, so if the
+  // person messages again (window reopens) the step delivers on a later tick.
+  // Comment-enrolled followers who never DM'd simply never get pushed DMs —
+  // that is the compliant behavior, not a bug.
+  const inWindow = await withinStandardWindow(db, fs.follower_id);
+  if (!inWindow) {
+    return;
+  }
+
+  // Outbound cap (reserve-before-send). Denied → retry on a later tick.
+  const reserved = await reserveAutoSend(db, {
+    accountId: accountId ?? 'default',
+    igsid: friend.igsid,
+    kind: 'scenario_step',
+    caps,
+  });
+  if (!reserved.ok) {
+    return;
   }
 
   // Expand template variables
