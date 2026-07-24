@@ -1,84 +1,114 @@
-# Configuration — LINE Harness 設定リファレンス
+# Configuration — IG Harness 設定リファレンス
 
 ## wrangler.toml
 
 Workers のデプロイ設定ファイル。パス: `apps/worker/wrangler.toml`
 
 ```toml
-name = "your-worker"
+name = "ig-harness"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 workers_dev = true
+account_id = "YOUR_ACCOUNT_ID"
 
 # シークレットは wrangler secret put で設定
 # ここにハードコードしない
 
 [[d1_databases]]
 binding = "DB"
-database_name = "line-crm"
+database_name = "instagram-harness"
 database_id = "YOUR_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "your-r2-bucket"
 
 [triggers]
 crons = ["*/5 * * * *"]
+
+# 自動送信を有効化する場合のみ（デフォルトは全 OFF — 下記「自動送信の安全スイッチ」参照）
+# [vars]
+# AUTO_DM_ENABLED = "1"
 ```
 
 ### 各フィールドの説明
 
 | フィールド | 値 | 説明 |
 |-----------|-----|------|
-| `name` | `your-worker` | Workers の名前（デプロイ先URLに影響） |
+| `name` | `ig-harness` | Workers の名前（デプロイ先URLに影響） |
 | `main` | `src/index.ts` | エントリーポイント |
 | `compatibility_date` | `2024-12-01` | Workers ランタイム互換日 |
 | `workers_dev` | `true` | `*.workers.dev` サブドメインを有効化 |
 | `binding` | `DB` | D1 バインディング名（コード内で `c.env.DB` としてアクセス） |
-| `database_name` | `line-crm` | D1 データベース名 |
+| `database_name` | `instagram-harness` | D1 データベース名 |
 | `database_id` | UUID | `wrangler d1 create` で取得した ID |
+| `bucket_name` | R2 バケット名 | 画像アップロード用 R2 バケット |
 | `crons` | `["*/5 * * * *"]` | 5分毎の Cron トリガー |
 
 ## 環境変数 / シークレット
 
 ### Workers シークレット（wrangler secret put）
 
-| 変数名 | 必須 | 型 | 説明 | 例 |
-|--------|------|-----|------|-----|
-| `LINE_CHANNEL_SECRET` | 必須 | string | Messaging API チャネルシークレット | `abc123def456...` |
-| `LINE_CHANNEL_ACCESS_TOKEN` | 必須 | string | Messaging API 長期アクセストークン | `eyJhbGciOi...` |
-| `API_KEY` | 必須 | string | REST API 認証用 Bearer トークン | `sk-my-secret-key` |
-| `LINE_CHANNEL_ID` | 任意 | string | Messaging API チャネルID | `1234567890` |
-| `LIFF_URL` | 任意 | string | LIFF アプリ URL | `https://liff.line.me/12345-abcde` |
-| `LINE_LOGIN_CHANNEL_ID` | 任意 | string | LINE Login チャネルID（UUID連携用） | `9876543210` |
-| `LINE_LOGIN_CHANNEL_SECRET` | 任意 | string | LINE Login チャネルシークレット | `xyz789...` |
+| 変数名 | 必須 | 型 | 説明 |
+|--------|------|-----|------|
+| `IG_APP_SECRET` | 必須 | string | Meta アプリシークレット（webhook 署名検証 `X-Hub-Signature-256` に使用） |
+| `IG_ACCESS_TOKEN` | 必須 | string | Instagram 長期アクセストークン |
+| `IG_USER_ID` | 必須 | string | Instagram ビジネスアカウントのユーザーID |
+| `IG_VERIFY_TOKEN` | 必須 | string | Webhook 購読検証トークン（`GET /webhook` の `hub.verify_token` 照合） |
+| `API_KEY` | 必須 | string | REST API 認証用 Bearer トークン |
+| `WORKER_URL` | 任意 | string | この Worker の公開 URL（トラッキングリンク生成等に使用） |
+| `IG_USERNAME` | 任意 | string | 表示用の IG ユーザー名（`ig.me` リンク生成に使用） |
+| `STRIPE_WEBHOOK_SECRET` | 任意 | string | Stripe 連携を使う場合のみ |
+| `LINE_HARNESS_LINK_SECRET` | 任意 | string | オプションの LINE 連携ブリッジを使う場合のみ |
+
+### 自動送信の安全スイッチ（AUTO_DM_ENABLED / 送信上限）
+
+自動 DM 送信（コメントルール / エンゲージメントゲート / 追い DM / ステップ配信 / 一斉配信 / フォーム確認 DM）は **fail-closed** です。これらはシークレットではなく通常の環境変数（`[vars]` または `wrangler deploy --var`）として設定します:
+
+| 変数名 | デフォルト | 説明 |
+|--------|-----------|------|
+| `AUTO_DM_ENABLED` | 未設定 = **全自動送信 OFF** | マスターキルスイッチ。**正確に `'1'` のときだけ**自動送信が有効。未設定・空・`'0'`・`'true'` など `'1'` 以外はすべて無効。OFF の間は、D1 に「有効」で保存済みのルール / ゲート / シナリオも発火せず、毎 Cron tick の監査付きスイープが武装済み行を自動解除する（migration 0022） |
+| `AUTO_DM_HOURLY_CAP` | `100` | アカウント毎のローリング1時間あたり送信上限 |
+| `AUTO_DM_DAILY_CAP` | `300` | アカウント毎のローリング24時間あたり送信上限 |
+| `AUTO_DM_RECIPIENT_DAILY_CAP` | `5` | 受信者毎のローリング24時間あたり送信上限 |
+
+- 上限は D1 の台帳で**送信前に予約**して強制される（再起動やデプロイでリセットされない）
+- 有効化の手順と Meta ポリシー上の注意（24h ウィンドウ / Private Reply / マス DM 禁止）は README の「安全について」を必ず読むこと
+- 緊急停止: `AUTO_DM_ENABLED` を外して（または `'1'` 以外にして）デプロイすれば全自動送信が止まる
 
 ### シークレット設定コマンド
 
 ```bash
 # 全シークレットを設定
-npx wrangler secret put LINE_CHANNEL_SECRET
-npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
+npx wrangler secret put IG_APP_SECRET
+npx wrangler secret put IG_ACCESS_TOKEN
+npx wrangler secret put IG_USER_ID
+npx wrangler secret put IG_VERIFY_TOKEN
 npx wrangler secret put API_KEY
-npx wrangler secret put LINE_CHANNEL_ID
-npx wrangler secret put LIFF_URL
-npx wrangler secret put LINE_LOGIN_CHANNEL_ID
-npx wrangler secret put LINE_LOGIN_CHANNEL_SECRET
 
 # 設定済みシークレット一覧確認
 npx wrangler secret list
 ```
 
-### Env 型定義
+### Env 型定義（抜粋）
 
 ```typescript
 // apps/worker/src/index.ts
 export type Env = {
   Bindings: {
     DB: D1Database;
-    LINE_CHANNEL_SECRET: string;
-    LINE_CHANNEL_ACCESS_TOKEN: string;
+    IG_APP_SECRET: string;
+    IG_ACCESS_TOKEN: string;
+    IG_USER_ID: string;
+    IG_VERIFY_TOKEN: string;
     API_KEY: string;
-    LIFF_URL: string;
-    LINE_CHANNEL_ID: string;
-    LINE_LOGIN_CHANNEL_ID: string;
-    LINE_LOGIN_CHANNEL_SECRET: string;
+    WORKER_URL: string;
+    IG_USERNAME?: string;
+    // 自動送信の安全スイッチ（fail-closed — 上記参照）
+    AUTO_DM_ENABLED?: string;
+    AUTO_DM_HOURLY_CAP?: string;
+    AUTO_DM_DAILY_CAP?: string;
+    AUTO_DM_RECIPIENT_DAILY_CAP?: string;
   };
 };
 ```
@@ -89,7 +119,7 @@ Next.js 管理画面で必要な環境変数。Vercel / CF Pages のダッシュ
 
 | 変数名 | 説明 | 例 |
 |--------|------|-----|
-| `NEXT_PUBLIC_API_URL` | Workers API URL | `https://your-line-worker.workers.dev` |
+| `NEXT_PUBLIC_API_URL` | Workers API URL | `https://your-ig-worker.workers.dev` |
 
 > **セキュリティ注意**: APIキーはログイン画面で入力する方式です。`NEXT_PUBLIC_*` にAPIキーを絶対に設定しないでください。クライアントバンドルに埋め込まれ、第三者から抽出可能になります。
 
@@ -99,7 +129,7 @@ Next.js 管理画面で必要な環境変数。Vercel / CF Pages のダッシュ
 
 ```bash
 # D1 作成
-npx wrangler d1 create line-crm
+npx wrangler d1 create instagram-harness
 
 # 出力される database_id を wrangler.toml に記入
 ```
@@ -107,22 +137,21 @@ npx wrangler d1 create line-crm
 ### スキーマ適用
 
 ```bash
-# 本番
-npx wrangler d1 execute line-crm --file=packages/db/schema.sql
+# 本番（スキーマ + マイグレーション）
+pnpm db:migrate
 
 # ローカル開発
 pnpm db:migrate:local
-# = wrangler d1 execute line-crm --file=packages/db/schema.sql --local
 ```
 
 ### D1 ダッシュボード確認
 
 ```bash
 # テーブル一覧確認
-npx wrangler d1 execute line-crm --command="SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+npx wrangler d1 execute instagram-harness --command="SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
 
 # レコード数確認
-npx wrangler d1 execute line-crm --command="SELECT COUNT(*) FROM friends"
+npx wrangler d1 execute instagram-harness --command="SELECT COUNT(*) FROM followers"
 ```
 
 ### D1 バインディング
@@ -131,7 +160,7 @@ Workers 内では `c.env.DB` として D1Database インスタンスにアクセ
 
 ```typescript
 const db = c.env.DB;
-const result = await db.prepare('SELECT * FROM friends WHERE id = ?').bind(id).first();
+const result = await db.prepare('SELECT * FROM followers WHERE id = ?').bind(id).first();
 ```
 
 ## Cron トリガー
@@ -147,18 +176,25 @@ crons = ["*/5 * * * *"]
 
 ### Cron ハンドラ
 
-5分毎に以下の4つの処理を `Promise.allSettled` で並列実行:
+5分毎の Cron tick は常時、トークン死活監視（実 Graph API 呼び出し）と Cron ハートビート記録を行う。**自動送信の3処理（ステップ配信 / 予約配信 / 追い DM）は `AUTO_DM_ENABLED='1'` のときのみ実行される**。OFF の間は、代わりに監査付きスイープ（`reconcileDarkAutoSend`）が D1 上の武装済みルール / ゲート / シナリオを自動解除する（migration 0022・冪等・復元可能）:
 
 ```typescript
-// apps/worker/src/index.ts
+// apps/worker/src/index.ts（要約）
 async function scheduled(event, env, ctx) {
-  const lineClient = new LineClient(env.LINE_CHANNEL_ACCESS_TOKEN);
-  await Promise.allSettled([
-    processStepDeliveries(env.DB, lineClient),      // ステップ配信
-    processScheduledBroadcasts(env.DB, lineClient),  // 予約配信
-    processReminderDeliveries(env.DB, lineClient),   // リマインダー
-    checkAccountHealth(env.DB),                       // ヘルスチェック
-  ]);
+  const autoDmLit = autoSendEnabled(env);   // AUTO_DM_ENABLED === '1' ?
+  if (!autoDmLit) {
+    ctx.waitUntil(reconcileDarkAutoSend(env.DB));  // 武装済み行の監査付き解除
+  }
+  for (const account of await listIgAccounts(env.DB, { activeOnly: true })) {
+    // トークン死活監視は常時実行
+    if (!autoDmLit) continue;               // ← ダークゲート: 送信処理は一切走らない
+    const caps = autoDmCaps(env);
+    await Promise.allSettled([
+      processStepDeliveries(env.DB, igClient, env.WORKER_URL, account.id, caps),      // ステップ配信
+      processScheduledBroadcasts(env.DB, igClient, env.WORKER_URL, account.id, caps), // 予約配信
+      processFollowupDrip(env.DB, igClient, env.WORKER_URL, undefined, ref, account.id, caps), // 追いDM
+    ]);
+  }
 }
 ```
 
@@ -200,8 +236,8 @@ app.use('*', cors({
 
 ### 設計方針
 
-LINE Harness は全タイムスタンプを **JST (UTC+9)** で統一しています。理由:
-- LINE公式アカウントの利用者は日本が大多数
+IG Harness は全タイムスタンプを **JST (UTC+9)** で統一しています。理由:
+- 主要な想定利用者が日本のアカウント運用者
 - Cron 配信の時間計算で UTC 変換ミスを防ぐ
 - D1 (SQLite) にはタイムゾーン機能がないため、アプリケーション層で統一
 
@@ -245,7 +281,7 @@ isTimeBefore(a: string, b: string): boolean
 配信予約はJST文字列で指定:
 
 ```bash
-curl -X POST https://your-line-worker.workers.dev/api/broadcasts \
+curl -X POST https://your-ig-worker.workers.dev/api/broadcasts \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -263,7 +299,7 @@ curl -X POST https://your-line-worker.workers.dev/api/broadcasts \
 
 | パス | 理由 |
 |------|------|
-| `/webhook` | LINE Webhook署名検証で保護 |
+| `/webhook` | Meta Webhook 署名検証（`X-Hub-Signature-256`）で保護 |
 | `/docs` | OpenAPI ドキュメント（公開） |
 | `/openapi.json` | OpenAPI 仕様（公開） |
 | `/api/affiliates/click` | クリックトラッキング（匿名アクセス可） |
@@ -300,7 +336,7 @@ ngrok 等で localhost をトンネル:
 ```bash
 ngrok http 8787
 # → https://xxxx.ngrok.io
-# LINE Console で Webhook URL を https://xxxx.ngrok.io/webhook に設定
+# Meta アプリダッシュボードで Webhook URL を https://xxxx.ngrok.io/webhook に設定
 ```
 
 ## npm スクリプト一覧

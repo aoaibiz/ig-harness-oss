@@ -2,42 +2,44 @@
 
 ## 概要
 
-LINE Harnessは3種類のWebhookメカニズムと通知システムを提供する:
+IG Harnessは複数のWebhookメカニズムと通知システムを提供する:
 
-1. **LINE Webhook（受信）** - LINE PlatformからLINE Harnessへのイベント通知
-2. **受信Webhook (Incoming)** - 外部システムからLINE Harnessへのデータ受信
-3. **送信Webhook (Outgoing)** - LINE Harnessから外部システムへのイベント通知
+1. **Meta Webhook（受信）** - Meta (Instagram) PlatformからIG Harnessへのイベント通知
+2. **受信Webhook (Incoming)** - 外部システムからIG Harnessへのデータ受信
+3. **送信Webhook (Outgoing)** - IG Harnessから外部システムへのイベント通知
 4. **通知ルール** - イベント発生時の管理者向け通知
 
-## 1. LINE Webhookイベント処理
+## 1. Meta (Instagram) Webhookイベント処理
 
 ### エンドポイント
 
 ```
-POST /webhook
+GET  /webhook   # 購読検証（hub.challenge エコーバック、IG_VERIFY_TOKEN 照合）
+POST /webhook   # イベント受信
 ```
 
-LINE Developers Consoleで設定するWebhook URL。認証はLINEの署名検証で行う（Bearer tokenではない）。
+Meta アプリダッシュボードで設定するWebhook URL。認証はMetaの署名検証で行う（Bearer tokenではない）。
 
 ### 署名検証
 
-```typescript
-const valid = await verifySignature(channelSecret, rawBody, signature);
-```
+`X-Hub-Signature-256` ヘッダーの値を `IG_APP_SECRET` でHMAC-SHA256検証する。
 
-`X-Line-Signature` ヘッダーの値を `LINE_CHANNEL_SECRET` でHMAC-SHA256検証する。無効な署名でも常に200 OKを返す（LINE Platformの要件）。
+> **重要（安全ゲート）**: webhook 経由の全自動送信は、リクエスト処理の冒頭で環境変数 `AUTO_DM_ENABLED` を評価する単一のダークゲートに通されます。`'1'` でない限り（デフォルト）、D1 に「有効」で保存済みのルール / ゲート / シナリオであっても発火しません。
 
 ### 処理されるイベント
 
+> **注**: Instagram の webhook には LINE の `follow` / `unfollow` に相当するイベントはありません。フォローだけでは 24h メッセージングウィンドウは開かないため、「フォローされたら自動 DM」はできません（[SETUP-GUIDE の「罠」](../SETUP-GUIDE.md)参照）。
+
 | イベント | 処理内容 |
 |---|---|
-| `follow` | 友だち登録/更新、プロフィール取得、friend_addシナリオ登録、delay=0のステップ即時配信、イベントバス発火 |
-| `unfollow` | `friends.is_following` を `false` に更新 |
-| `message` (text) | メッセージログ記録、チャット作成/更新、自動応答チェック、イベントバス発火 |
+| `messaging` (DM 受信) | フォロワー登録/更新、メッセージログ記録。`AUTO_DM_ENABLED='1'` のときのみ: DM キーワードゲート発火、`dm_keyword` シナリオ登録（+ delay=0 の初回ステップ即時配信 — 相手の DM への返信なのでウィンドウ内。送信上限チェックあり） |
+| `messaging` (postback) | ボタン押下の処理（ゲートのフォロー確認 → 特典配布など）。`AUTO_DM_ENABLED='1'` のときのみ送信。同一 mid の再配送は claim で重複排除 |
+| `changes: comments` | コメントログ記録。`AUTO_DM_ENABLED='1'` のときのみ: コメントルール / コメントゲートの発火（コメント起点 DM は Private Reply のみ）、`comment` シナリオ登録（**登録のみ** — 送信は Cron 側） |
+| `changes: mentions` | フォロワー記録（CRM）のみ。**DM は送信しない**（ポリシー準拠の送信経路が存在しないため） |
 
 ### 即時配信の仕組み
 
-友だち追加時、`delay_minutes = 0` の最初のステップは即座にpushMessageで送信される（cronの5分待ちを回避）。2番目以降のステップはcronスケジュールに委ねられる。
+`dm_keyword` シナリオ登録時に限り、`delay_minutes = 0` の最初のステップは cron の5分待ちを回避して送信される。この送信は相手自身の DM への返信（= 24h ウィンドウ内）であり、`AUTO_DM_ENABLED='1'` かつ送信上限を予約できた場合のみ実行される。2番目以降のステップ、および `comment` / `manual` 登録の全ステップは cron スケジュール（ウィンドウ + 上限チェック付き）に委ねられる。
 
 ### イベントバス発火
 

@@ -2,7 +2,9 @@
 
 ## 概要
 
-ステップ配信（シナリオ）は、IG Harness のコア機能です。フォローやタグ付与などのトリガーに応じて、事前に定義したメッセージを遅延配信します。条件分岐、負荷を平準化した配信、即時配信にも対応しています。
+ステップ配信（シナリオ）は、IG Harness のコア機能です。キーワード DM の受信やコメントなどのトリガーに応じて、事前に定義したメッセージを遅延配信します。条件分岐、負荷を平準化した配信、即時配信にも対応しています。
+
+> **安全ゲート（fail-closed）**: ステップ配信を含む全自動送信は、環境変数 `AUTO_DM_ENABLED` が正確に `'1'` のときだけ動作します（未設定 = 全 OFF、デフォルト）。また各ステップの送信は受信者ごとの 24h スタンダードウィンドウ（相手が最後にこちらへ DM を送ってから 24 時間以内）の実チェックを通過した場合のみ実行されます。詳細は README の「安全について」を参照してください。
 
 ## データモデル
 
@@ -13,8 +15,8 @@
 | `id` | TEXT (UUID) | 主キー |
 | `name` | TEXT | シナリオ名 |
 | `description` | TEXT | 説明 |
-| `trigger_type` | TEXT | `friend_add` / `tag_added` / `manual` |
-| `trigger_tag_id` | TEXT | tag_added 時のタグID |
+| `trigger_type` | TEXT | `dm_keyword` / `comment` / `manual`（`follower_add` はスキーマ上予約済みだが、Instagram にはフォローで DM ウィンドウが開く webhook が無いため発火経路なし） |
+| `trigger_tag_id` | TEXT | タグ連動時のタグID |
 | `is_active` | INTEGER | 有効: 1 / 無効: 0 |
 | `created_at` | TEXT | 作成日時 (JST) |
 | `updated_at` | TEXT | 更新日時 (JST) |
@@ -51,29 +53,38 @@
 
 | トリガー | 値 | 発火タイミング |
 |---------|-----|--------------|
-| 友だち追加 | `friend_add` | Webhook follow イベント受信時 |
-| タグ追加 | `tag_added` | `POST /api/friends/:id/tags` 実行時（trigger_tag_id と一致） |
-| 手動 | `manual` | `POST /api/scenarios/:id/enroll/:friendId` 実行時 |
+| キーワード DM | `dm_keyword` | trigger_keyword を含む DM 受信時（webhook）。登録 + 最初のステップが delay=0 なら即時配信（下記参照） |
+| コメント | `comment` | 自社投稿へのコメント受信時（webhook）。**登録のみ** — ステップ送信は Cron 側（24h ウィンドウ + 上限チェック付き）でのみ行われる |
+| 手動 | `manual` | `POST /api/scenarios/:id/enroll/:friendId` 実行時（登録のみ） |
+
+> **フォローをトリガーにした自動 DM はできません**: Instagram の webhook には LINE の `follow` に相当する「フォローされた」イベントで DM ウィンドウが開く仕組みがなく、フォローだけでは 24h ウィンドウは開きません（[SETUP-GUIDE の「罠」](../SETUP-GUIDE.md)参照）。フォロー直後に何かを届けたい場合は、コメントやキーワード DM など、相手側のアクションを起点にしてください。
 
 ## 配信メカニズム
 
-### 初回登録時の即時配信
+### 初回登録時の即時配信（dm_keyword トリガーのみ）
 
-`delay_minutes=0` の最初のステップは、Cron を待たずに **即座に** 配信されます:
+`dm_keyword` トリガーでの登録時に限り、`delay_minutes=0` の最初のステップは Cron を待たずに配信されます。この送信は相手自身の DM への返信なので 24h ウィンドウ内であることが構造的に保証されますが、それでも `AUTO_DM_ENABLED='1'` と送信上限（アカウント毎/受信者毎のローリング上限）のチェックを通過した場合のみ実行されます:
 
 ```
-友だち追加 → enrollFriendInScenario()
+キーワード DM 受信（AUTO_DM_ENABLED='1' のときのみ到達）
+  → enrollFriendInScenario()
   └─ 最初のステップが delay_minutes=0 ?
-     ├─ YES → pushMessage() で即時配信
-     │         → 2番目のステップがあれば next_delivery_at を計算
-     │         → なければ completeFriendScenario()
+     ├─ YES → 送信上限を予約（reserve）できたか?
+     │    ├─ YES → 即時配信（相手の受信 DM への返信 = ウィンドウ内）
+     │    │         → 2番目のステップがあれば next_delivery_at を計算
+     │    │         → なければ completeFriendScenario()
+     │    └─ NO  → ここでは送らず Cron 側（ウィンドウ + 上限チェック付き）に委ねる
      └─ NO  → next_delivery_at を計算して Cron に委ねる
 ```
 
+`comment` / `manual` トリガーでの登録時は即時配信は行われません（登録のみ）。ステップは Cron 配信フローでのみ送信されます。
+
 ### Cron 配信フロー（5分毎）
 
+`AUTO_DM_ENABLED` が `'1'` でない間、Cron はステップ配信処理そのものを実行しないため、配信予定が来てもステップは発火しません。さらに、有効のまま残っているシナリオ（`is_active=1`）は毎 Cron tick の監査付きスイープが自動で無効化します（復元可能 — migration 0022 の go-live restore 手順参照）。有効時のフロー:
+
 ```
-processStepDeliveries(db, lineClient)
+processStepDeliveries(db, igClient)   ※ AUTO_DM_ENABLED='1' のときのみ実行
   │
   ├─ getFriendScenariosDueForDelivery(db, jstNow())
   │   WHERE status = 'active' AND next_delivery_at <= NOW
@@ -84,10 +95,16 @@ processStepDeliveries(db, lineClient)
       ├─ 次ステップ検索: step_order > current_step_order
       │   └─ 見つからない → completeFriendScenario()
       ├─ 条件チェック: evaluateCondition()
-      │   ├─ 一致 → メッセージ送信
+      │   ├─ 一致 → 送信フローへ
       │   └─ 不一致 → next_step_on_false にジャンプ or スキップ
-      ├─ buildMessage() → LINE メッセージ構築
-      ├─ lineClient.pushMessage() → 送信
+      ├─ 24h ウィンドウ実チェック: withinStandardWindow()
+      │   └─ ウィンドウ外 → 送らない・進めない（pending のまま。
+      │       相手が再度 DM してウィンドウが開けば後続 tick で配信。
+      │       コメント経由で登録され一度も DM していない相手には
+      │       push DM は送られない = ポリシー準拠の正常動作）
+      ├─ 送信上限の予約: reserveAutoSend()（アカウント毎/受信者毎の
+      │   ローリング上限。予約不可 → 後続 tick で再試行）
+      ├─ igClient で送信
       ├─ messages_log に記録
       └─ advanceFriendScenario() or completeFriendScenario()
           └─ 負荷平準化: jitterDeliveryTime(±5分)

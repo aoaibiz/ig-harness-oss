@@ -46,18 +46,15 @@ LINE Harness の友だち管理は、LINE公式アカウントのフォロワー
 
 ## Webhook 自動登録フロー
 
-ユーザーが LINE 公式アカウントを友だち追加すると:
+> **注**: Instagram の webhook には LINE の `follow` / `unfollow` イベントは存在しません。フォロワーは「フォローされた瞬間」ではなく、**相手が DM・コメント・メンションで接触してきたとき**に自動登録されます。フォロー状態はプロフィール取得（`is_user_follow_business`）で判定します。フォローだけでは 24h メッセージングウィンドウも開かないため、「フォローされたら自動 DM」はできません。
 
-1. LINE Platform → `POST /webhook` (follow イベント)
-2. `verifySignature()` で署名検証
-3. `lineClient.getProfile(userId)` でプロフィール取得
-4. `upsertFriend()` で friends テーブルに INSERT（既存なら UPDATE + is_following=1）
-5. `trigger_type='friend_add'` のアクティブシナリオを検索
-6. 該当シナリオに `enrollFriendInScenario()` で登録
-7. `fireEvent('friend_add', ...)` でイベントバス発火
+ユーザーが DM を送ってくる / コメントする / メンションすると:
 
-ブロック（unfollow）時:
-1. `updateFriendFollowStatus(db, userId, false)` で `is_following=0` に更新
+1. Meta Platform → `POST /webhook`（messaging / comments / mentions イベント）
+2. `X-Hub-Signature-256` を `IG_APP_SECRET` で署名検証
+3. `igClient.getUserProfile(igsid)` でプロフィール取得（username・フォロー状態 `is_user_follow_business`・フォロワー数など。mentions のみ profile 取得なしで webhook ペイロードの情報から登録）
+4. `upsertFriend()` で followers テーブルに INSERT（既存なら UPDATE）
+5. 以降の自動処理（ゲート / シナリオ登録・発火）は `AUTO_DM_ENABLED='1'` のときのみ（mentions は記録のみで送信なし — [Webhooks](15-Webhooks-and-Notifications.md) 参照）
 
 ## API エンドポイント
 
